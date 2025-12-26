@@ -32,7 +32,7 @@ def is_component_pin(name: str) -> bool:
     return True
 
 # --- Regex Patterns ---
-re_item = re.compile(r'^\s*([A-Za-z0-9_\.\/\*]+)\s+([\-0-9\.]+)\s+([\-0-9\.]+)\s+([LDV])?\s*([0-9\.]+)\s*(.*)?$')
+re_item = re.compile(r'^\s*([A-Za-z0-9_\.\/\*]+)\s+([\-0-9\.]+)\s+([\-0-9\.]+)\s+([LBDV])?\s*([0-9\.]+)\s*(.*)?$')
 re_total = re.compile(r'^\s*TOTAL\s+(\d+)\s+VIA\(S\)\s+([0-9\.]+)\s+mils')
 
 def parse_file(path: str) -> List[Dict]:
@@ -129,7 +129,7 @@ def convert_net_to_segments(n: Dict) -> Dict:
 
     final_segments = []
     for i, seg in enumerate(raw_segments):
-        if seg['length'] < 0.01:
+        if seg['length'] < 0.02:
             if final_segments and seg['next_conn']:
                 final_segments[-1]['next_conn'] = seg['next_conn']
         else:
@@ -348,8 +348,6 @@ def combine_to_excel(input_files: List[str], output_file: str, include_source: b
     for item in extra_items:
         cell = stackup_ws[f'A{stackup_row}']
         cell.value = item
-        cell.font = openpyxl.styles.Font(bold=True, italic=True)
-        cell.fill = openpyxl.styles.PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
         stackup_row += 1
     
     stackup_ws.column_dimensions['A'].width = 25
