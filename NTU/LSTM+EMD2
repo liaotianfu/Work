@@ -1,0 +1,199 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
+from PyEMD import EMD
+
+from torch.utils.data import Dataset, DataLoader
+
+# 1. 設置裝置
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# 2. 數據準備與 EMD 分解
+ticker = yf.Ticker("^IXIC")
+df = ticker.history(period="5y")  # 每日資料
+close = df["Close"].values.astype(float)   # shape: (N,)
+dates = df.index.to_pydatetime()
+
+print("原始資料長度:", len(close))
+
+emd = EMD()
+imfs = emd.emd(close)  # imfs.shape -> (num_imf, N)
+print("IMF 數量:", imfs.shape[0])
+
+# PyEMD 的 emd: 預設無返回 residue，要自己算
+reconstructed = np.sum(imfs, axis=0)
+residue = close - reconstructed
+
+# 取最後 IMF
+last_imf = imfs[6]
+data = last_imf.reshape(-1, 1)
+
+train_window = 32  # 視窗加長
+
+# 先切 train/test，再做 scaler fit
+train_size_idx = int(len(data) * 0.8)
+train_data_raw = data[:train_size_idx]
+test_data_raw = data[train_size_idx:]
+
+scaler = MinMaxScaler(feature_range=(0, 1))
+scaler.fit(train_data_raw)
+
+train_data_normalized = scaler.transform(train_data_raw)
+test_data_normalized = scaler.transform(test_data_raw)
+
+# --------- 建 Dataset / DataLoader ---------
+def create_xy(input_array, tw):
+    """
+    input_array: ndarray, shape (N, 1)
+    return X: (num_samples, tw, 1), y: (num_samples, 1)
+    """
+    x_list, y_list = [], []
+    L = len(input_array)
+    if L <= tw:
+        return np.empty((0, tw, 1)), np.empty((0, 1))
+    for i in range(L - tw):
+        x_list.append(input_array[i:i+tw])
+        y_list.append(input_array[i+tw])
+    return np.array(x_list), np.array(y_list)
+
+X_train, y_train = create_xy(train_data_normalized, train_window)
+X_test, y_test = create_xy(test_data_normalized, train_window)
+
+class TimeSeriesDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.from_numpy(X).float()
+        self.y = torch.from_numpy(y).float()
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+batch_size = 32
+train_dataset = TimeSeriesDataset(X_train, y_train)
+test_dataset = TimeSeriesDataset(X_test, y_test)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+print("Train samples:", len(train_dataset))
+print("Test samples :", len(test_dataset))
+
+# --------- LSTM 模型 ---------
+class LSTMModel(nn.Module):
+    def __init__(self, input_size=1, hidden_size=64, num_layers=2, output_size=1, dropout=0.2):
+        super(LSTMModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+        self.lstm = nn.LSTM(
+            input_size,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        # x: (batch, seq_len, input_size)
+        batch_size = x.size(0)
+        h0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(device)
+        c0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(device)
+
+        out, _ = self.lstm(x, (h0, c0))   # (batch, seq_len, hidden)
+        out = out[:, -1, :]               # (batch, hidden)
+        out = self.fc(out)                # (batch, 1)
+        return out
+
+model = LSTMModel(input_size=1, hidden_size=64, num_layers=2, output_size=1, dropout=0.2).to(device)
+
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+epochs = 60  # 拉高 epoch 數
+
+print("Start Training...")
+for epoch in range(epochs):
+    model.train()
+    epoch_loss = 0.0
+    for seq_batch, labels_batch in train_loader:
+        seq_batch = seq_batch.to(device)      # (B, T, 1)
+        labels_batch = labels_batch.to(device)  # (B, 1)
+
+        optimizer.zero_grad()
+        y_pred = model(seq_batch)
+        loss = criterion(y_pred, labels_batch)
+        loss.backward()
+        optimizer.step()
+
+        epoch_loss += loss.item() * seq_batch.size(0)
+
+    avg_loss = epoch_loss / len(train_dataset)
+    if (epoch + 1) % 5 == 0 or epoch == 0:
+        print(f"Epoch {epoch+1:3d} | Train Loss: {avg_loss:.8f}")
+
+# --------- 評估 / 預測 ---------
+model.eval()
+all_preds = []
+all_labels = []
+
+with torch.no_grad():
+    for seq_batch, labels_batch in test_loader:
+        seq_batch = seq_batch.to(device)
+        preds = model(seq_batch)
+        all_preds.append(preds.cpu().numpy())
+        all_labels.append(labels_batch.cpu().numpy())
+
+test_predictions = np.vstack(all_preds)  # (N_test, 1)
+test_actuals = np.vstack(all_labels)     # (N_test, 1)
+
+# 反標準化
+actual_predictions = scaler.inverse_transform(test_predictions)
+actual_values = scaler.inverse_transform(test_actuals)
+
+# --------- 畫 IMF 與預測 ---------
+def plot_emd_result(dates, signal, imfs, residue):
+    num_imf = imfs.shape[0]
+    total_plots = num_imf + 2  # 原始 + IMFs + residue
+
+    plt.figure(figsize=(12, 2 * total_plots))
+
+    # 原始
+    ax = plt.subplot(total_plots, 1, 1)
+    ax.plot(dates, signal, label="Close")
+    ax.set_title("NASDAQ ^IXIC Close (Original)")
+    ax.grid(True)
+
+    # IMF
+    for i in range(num_imf):
+        ax = plt.subplot(total_plots, 1, i + 2)
+        ax.plot(dates, imfs[i], label=f"IMF {i+1}")
+        ax.set_ylabel(f"IMF {i+1}")
+        ax.grid(True)
+
+    # Residue
+    ax = plt.subplot(total_plots, 1, total_plots)
+    ax.plot(dates, residue, label="Residue / Trend", color="red")
+    ax.set_ylabel("Residue")
+    ax.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+plot_emd_result(dates, close, imfs, residue)
+
+plt.figure(figsize=(15, 6))
+plt.plot(actual_values, label=' IMF Actual', color='blue')
+plt.plot(actual_predictions, label=' IMF Prediction', color='red', linestyle='--')
+plt.title(f'NASDAQ IMF Prediction using LSTM (Window={train_window})')
+plt.xlabel('Time (Days in Test Set)')
+plt.ylabel('IMF Amplitude')
+plt.legend()
+plt.grid(True)
+plt.show()
